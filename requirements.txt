@@ -1,4 +1,4 @@
 streamlit
 numpy
 opencv-python-headless
-scikit-learn
+extcolors

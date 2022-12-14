@@ -258,8 +258,8 @@ def main():
 
     # add navigation controls
     col01, col02, col03, col04, col05 = st.columns([2,1,2,2,2]) #prev, imgs_ix, next, generate, save_all
+    progress = st.progress(0)
     if st.session_state.imgs_ix>=0:
-        progress = st.progress(0)
         zoom_factor = st.select_slider('Zoom', options=[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1,1.5,2,2.5,3], value=1)
         resize(st.session_state.imgs, st.session_state.imgs_ix, zoom_factor)
         cntnr01 = st.expander('ColorMap Controls', expanded=True)

@@ -20,4 +20,5 @@
 1. Create a github repo using a clone of this repo.
 2. Login to your www.streamlit.io account.
 3. Follow on screen instructions to link the repo to your streamlit account.
+4. Copy secrets.toml file content to the app settings as shown in https://docs.streamlit.io/streamlit-cloud/get-started/deploy-an-app/connect-to-data-sources/secrets-management
 4. Use the provided link to open the app from any web browser.

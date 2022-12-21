@@ -1,12 +1,20 @@
 import cv2
+import ssl
+import json
+import time
+import hashlib
+import certifi
 import extcolors
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageChops
+import mysql.connector
 import streamlit as st
 from io import BytesIO
+import cryptocode as crc
 from copy import deepcopy
 from zipfile import ZipFile
 from datetime import datetime
+from urllib import request, parse, error
 
 def ix_change(mode=0):
     """manipulate index of image to be shown based on clicks from relevant prev/next buttons"""
@@ -42,8 +50,33 @@ def resize(img, ix, zoom_factor):
     inp = cv2.resize(inp, None, fx=zoom_factor, fy=zoom_factor, interpolation=cv2.INTER_AREA)
     img[ix]['zoom'] = inp
 
+def remove_border(img, ver, hor):
+
+    # add 5 pixels to image in each direction
+    img = cv2.copyMakeBorder(img,5,5,5,5,cv2.BORDER_CONSTANT,img[0,0])
+
+    # clean out border
+    v = int(ver*img.shape[0])
+    h = int(hor*img.shape[1])
+    color = [255,255,255]
+    if v>0:
+        img[:v+5,:] = color
+        img[img.shape[0]-v-5:img.shape[0],:]=color
+    if h>0:
+        img[:, :h+5] = color
+        img[:, img.shape[1]-h-5:img.shape[1]]=color
+
+    #remove background
+    cv2.floodFill(img, None, (0,0), (255,255,255))
+    cv2.floodFill(img, None, (img.shape[1]-5,0), (255,255,255))
+    cv2.floodFill(img, None, (0,img.shape[0]-5), (255,255,255))
+    cv2.floodFill(img, None, (img.shape[1]-5,img.shape[0]-5), (255,255,255))
+
+    return img
+
 def clean(img):
     """remove noise from image"""
+    #denoise
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (8,8))
     image =  cv2.fastNlMeansDenoisingColored(img,None,10,10,7,21)
     image = cv2.morphologyEx(image, cv2.MORPH_OPEN, kernel, cv2.BORDER_REPLICATE)
@@ -52,14 +85,14 @@ def clean(img):
 
 def generate(img, ix, num_clrs, progress_bar):
     """generate 'color by number' image from the passed image, index and number of color clusters"""
-    inp = img[ix]['zoom'] #resize is performed separately for interface convenience
+    inp = deepcopy(img[ix]['zoom']) #resize is performed separately for interface convenience
     #image = inp #image = resize(inp)
     image = clean(inp)
     colormap = img[ix]['colormap_tuples']
     colortxt = img[ix]['colormap_text']
     quantized = quantize(image, colormap, colortxt)
     cbn = CBN(quantized, colormap, progress_bar)
-    map_img, fontscale = draw_colormap(colormap, colortxt, inp.shape[0], inp.shape[1])
+    map_img, fontscale = draw_colormap(colormap, colortxt, inp.shape[0], inp.shape[1], img[ix]['show_clr_box'])
     img[ix]['quantized'] = quantized
     img[ix]['out'] = cbn
     img[ix]['color_map'] = map_img
@@ -113,49 +146,52 @@ def CBN(img, colors, progress_bar):
     contours = tuple([x['cnt'] for x in contours])
 
     for i, cnt in enumerate(contours):
-        cv2.drawContours(canvas,[cnt],-1,0,thickness=1)
-
-        #identify suitable place to put text
+        # consider only contours within 95% of image size.
         cnt_x, cnt_y, cnt_w, cnt_h = cv2.boundingRect(cnt)
-        #patch = negative[cnt_y:cnt_y+cnt_h, cnt_x:cnt_x+cnt_w, :] #get a patch from the negative
-        patch = negative[cnt_y:cnt_y+cnt_h, cnt_x:cnt_x+cnt_w] #get a patch from the negative
-        font_scale=1
-        flag = True
-        while flag:
-            if font_scale >0.5: #try to find a suitable place to put the text with font scale from 1 to 0.5
-                txt_w, txt_h = cv2.getTextSize(txts[i], cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)[0] #get the text size in w x h
-                if patch.shape[0]>txt_h and patch.shape[1]>txt_w: #check patch is bigger than text
+        if cnt_w < 0.95*canvas.shape[1] and cnt_h <0.95*canvas.shape[0]:
 
-                    #select indices that when considered as a top-left coordinate for text result in complete white box that is inside the contour
-                    white_patches = np.argwhere(np.lib.stride_tricks.sliding_window_view(patch,(txt_h,txt_w)).all(axis=(-2,-1)))
-                    white_patches = white_patches.tolist()
-                    white_patches = [x for x in white_patches if
-                                    cv2.pointPolygonTest(cnt, (x[1]+cnt_x,x[0]+cnt_y), False)>0 #TL of text in contour
-                                    and cv2.pointPolygonTest(cnt, (x[1]+cnt_x+txt_w,x[0]+cnt_y), False)>0 #TR of text in contour
-                                    and cv2.pointPolygonTest(cnt, (x[1]+cnt_x+txt_w,x[0]+cnt_y+txt_h), False)>0 #BR of text in contour
-                                    and cv2.pointPolygonTest(cnt, (x[1]+cnt_x,x[0]+cnt_y+txt_h), False)>0 ] #BL of text in contour
+            # draw contour
+            cv2.drawContours(canvas,[cnt],-1,0,thickness=1)
 
-                    if len(white_patches)>0: # if there are top-left coordinates found, use the first coordinate (any one can be as good) to place text
-                        txt_x = white_patches[0][1]+cnt_x
-                        txt_y = white_patches[0][0]+cnt_y+txt_h
-                        cv2.putText(canvas, txts[i], (txt_x, txt_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, 0, 1)
-                        flag = False
-                    else: #no top-left coordinates found, decrease font scale and try again
+            #identify suitable place to put text
+            patch = negative[cnt_y:cnt_y+cnt_h, cnt_x:cnt_x+cnt_w] #get a patch from the negative
+            font_scale=1
+            flag = True
+            while flag:
+                if font_scale >0.5: #try to find a suitable place to put the text with font scale from 1 to 0.5
+                    txt_w, txt_h = cv2.getTextSize(txts[i], cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)[0] #get the text size in w x h
+                    if patch.shape[0]>txt_h and patch.shape[1]>txt_w: #check patch is bigger than text
+
+                        #select indices that when considered as a top-left coordinate for text result in complete white box that is inside the contour
+                        white_patches = np.argwhere(np.lib.stride_tricks.sliding_window_view(patch,(txt_h,txt_w)).all(axis=(-2,-1)))
+                        white_patches = white_patches.tolist()
+                        white_patches = [x for x in white_patches if
+                                        cv2.pointPolygonTest(cnt, (x[1]+cnt_x,x[0]+cnt_y), False)>0 #TL of text in contour
+                                        and cv2.pointPolygonTest(cnt, (x[1]+cnt_x+txt_w,x[0]+cnt_y), False)>0 #TR of text in contour
+                                        and cv2.pointPolygonTest(cnt, (x[1]+cnt_x+txt_w,x[0]+cnt_y+txt_h), False)>0 #BR of text in contour
+                                        and cv2.pointPolygonTest(cnt, (x[1]+cnt_x,x[0]+cnt_y+txt_h), False)>0 ] #BL of text in contour
+
+                        if len(white_patches)>0: # if there are top-left coordinates found, use the first coordinate (any one can be as good) to place text
+                            txt_x = white_patches[0][1]+cnt_x
+                            txt_y = white_patches[0][0]+cnt_y+txt_h
+                            cv2.putText(canvas, txts[i], (txt_x, txt_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, 0, 1)
+                            flag = False
+                        else: #no top-left coordinates found, decrease font scale and try again
+                            font_scale -=0.1
+                    else: #patch is smaller than text, decrease font and try again
                         font_scale -=0.1
-                else: #patch is smaller than text, decrease font and try again
-                    font_scale -=0.1
-            else: #we reached minimum possible font size. Place text at centroid of contour
-                M = cv2.moments(cnt) #use contour centroid
-                txt_x = int(M["m10"] / M['m00'])
-                txt_y = int(M["m01"] / M['m00'])
-                cv2.putText(canvas, txts[i], (txt_x, txt_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, 0, 1)
-                flag= False
+                else: #we reached minimum possible font size. Place text at centroid of contour
+                    M = cv2.moments(cnt) #use contour centroid
+                    txt_x = int(M["m10"] / M['m00'])
+                    txt_y = int(M["m01"] / M['m00'])
+                    cv2.putText(canvas, txts[i], (txt_x, txt_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, 0, 1)
+                    flag= False
 
-        cv2.drawContours(negative,[cnt],-1,0,thickness=cv2.FILLED) #fill the contour in negative with black (to create negative)
+            cv2.drawContours(negative,[cnt],-1,0,thickness=cv2.FILLED) #fill the contour in negative with black (to create negative)
         progress_bar.progress(i/len(contours))
     return canvas
 
-def draw_colormap(colormap, colortext, h, w):
+def draw_colormap(colormap, colortext, h, w, show_clr_box):
     """Plot or save the colormap as a picture for the user"""
     num_colors = len(colormap)
     num_patches = 4 if num_colors>=4 else num_colors #number of patches in a row
@@ -199,8 +235,9 @@ def draw_colormap(colormap, colortext, h, w):
             clr = np.ones((max_clr[1], max_clr[0], 3), dtype='uint8')*255
             txt = np.ones((max_txt[1], max_txt[0], 3), dtype='uint8')*255
             if ix < len(colormap):
-                clr = cv2.rectangle(clr, (0+clr_offset[0],0+clr_offset[1]), (max_clr[0]-clr_offset[0],max_clr[1]-clr_offset[1]), colormap[ix], thickness=-1)
-                clr = cv2.rectangle(clr, (0+clr_offset[0],0+clr_offset[1]), (max_clr[0]-clr_offset[0],max_clr[1]-clr_offset[1]), (0,0,0), thickness=3)
+                if show_clr_box:
+                    clr = cv2.rectangle(clr, (0+clr_offset[0],0+clr_offset[1]), (max_clr[0]-clr_offset[0],max_clr[1]-clr_offset[1]), colormap[ix], thickness=-1)
+                    clr = cv2.rectangle(clr, (0+clr_offset[0],0+clr_offset[1]), (max_clr[0]-clr_offset[0],max_clr[1]-clr_offset[1]), (0,0,0), thickness=3)
                 txt = cv2.putText(txt, clr_txt[ix], (0,max_txt[1]-5), font_face, font_scale, (0,0,0), thickness=1)
             if col == 0:
                 rowbuild = np.hstack((small,clr,txt))
@@ -218,16 +255,195 @@ def draw_colormap(colormap, colortext, h, w):
     mapbuild = np.hstack((mapbuild,pad))
     return mapbuild, font_scale
 
-def main():
-    # defining side bar settings for easier access
-    is_clear = st.sidebar.button('Clear All Data')
-    if is_clear:
-        st.sidebar.info('To properly delete all data, make sure there are no files listed by name below the file uploader window by pressing the [X] button beside each file')
-        for key in st.session_state.keys():
-            del st.session_state[key]
+#@st.experimental_singleton caches the function to execute only once. While good to avoid multiple connections, but sometimes the connection is lost.
+def init_connection():
+    """Initiate connection to database. """
+    return mysql.connector.connect(**st.secrets['mysql'])
 
+def query_db(query):
+    """Execute SQL query on database and returns number of rows, rows content. """
+    conn = init_connection()
+    cur = conn.cursor()
+    cur.execute(query)
+    rows = cur.fetchall()
+    return len(rows), rows
+
+def licenseCheck(license_key, product_id):
+    url_ = "https://api.gumroad.com/v2/licenses/verify"
+    pf_permalink = product_id
+    params = {'product_permalink': pf_permalink, 'license_key': license_key}
+    data=parse.urlencode(params).encode('ascii')
+    req = request.Request(url_, data=data)
+    try:
+        response = request.urlopen(req, context=ssl.create_default_context(cafile=certifi.where()))
+        get_response = json.loads(response.read())
+    except error.HTTPError as e:
+        get_response = json.loads(e.read())
+    status = False
+    if get_response['success']:
+        status = True
+    else:
+        get_response = "Failed to verify the license."
+    return status, get_response , license_key
+
+def signUp(name, email, username, password, rep_password, license_key):
+    st.session_state.user = ''
+    st.session_state.logged = False
+    msg = []
+    msg_state = []
+    flag = True
+    num = 0
+    rows = []
+    username = username.lower()
+
+        # from db each line is [id, name_pass, email_pass, username_pass, hash_license, hash_user, hash_email]
+    if password != rep_password: #password mismatch
+        msg.append('Password and Repeat Password fields are not the same. Please Try Again!')
+        msg_state.append('warning')
+        flag = False
+    if flag:
+        if licenseCheck(license_key,'wkdhw')[0] != True: #license key is not correct
+            msg.append('License Key is incorrect!')
+            msg_state.append('error')
+            flag = False
+    if flag:
+        num, rows = query_db("SELECT HL, HU, HE From users WHERE HL = '{}' OR HU = '{}' OR HE = '{}'".format(
+                            hashlib.sha512(license_key.encode()).hexdigest(), hashlib.sha512(username.encode()).hexdigest(), hashlib.sha512(email.encode()).hexdigest() ))
+        if num > 0:
+            if hashlib.sha512(license_key.encode()).hexdigest() in [r[0] for r in rows]: #license is used already
+                msg.append('This license is already registered!')
+                msg_state.append('error')
+                flag = False
+            if hashlib.sha512(username.encode()).hexdigest() in [r[1] for r in rows]: #username exists
+                msg.append('Username is already used. Please use another Username')
+                msg_state.append('warning')
+                flag = False
+            if hashlib.sha512(email.encode()).hexdigest() in [r[2] for r in rows]: #email exists
+                msg.append('This email is already used.')
+                msg_state.append('warning')
+                flag = False
+
+    if flag: #all checks passed
+        NP = crc.encrypt(name, password)
+        EP = crc.encrypt(email, password)
+        UP = crc.encrypt(username, password)
+        HL = hashlib.sha512(license_key.encode()).hexdigest()
+        HU = hashlib.sha512(username.encode()).hexdigest()
+        HE = hashlib.sha512(email.encode()).hexdigest()
+        query = """ INSERT INTO users (NP, EP, UP, HL, HU, HE)
+                    VALUES ('{}', '{}', '{}', '{}', '{}', '{}')""".format(NP, EP, UP, HL, HU, HE)
+        query_db(query)
+
+        st.session_state.user = name
+        st.session_state.logged = True
+        msg.append('Registration Successful')
+        msg_state.append('success')
+    return msg_state, msg
+
+def signIn(username, password):
+    st.session_state.user = ''
+    st.session_state.logged = False
+    msg = []
+    msg_state = []
+    username = username.lower()
+
+    # from db each line is [id, name_pass, email_pass, username_pass, hash_password, hash_license, hash_user, hash_email]
+    num, rows = query_db("SELECT NP, UP FROM users WHERE HU = '{}' ".format( hashlib.sha512(username.encode()).hexdigest() ))
+
+    if num == 1 and crc.decrypt(rows[0][1], password) == username:
+        st.session_state.user = crc.decrypt(rows[0][0], password)
+        st.session_state.logged = True
+        msg.append('Sign In Successful')
+        msg_state.append('success')
+    else:
+        msg.append('Username / Password Mismatch! Please try again.')
+        msg_state.append('error')
+    return msg_state, msg
+
+def forgotDetails(license_key, email):
+    st.session_state.user = ''
+    st.session_state.logged = False
+    msg = []
+    msg_state = []
+
+    num, rows = query_db("SELECT * FROM users WHERE HL = '{}' AND HE = '{}' ".format(
+                        hashlib.sha512(license_key.encode()).hexdigest(), hashlib.sha512(email.encode()).hexdigest() ))
+
+    if num == 0:
+        msg.append('This License Key / email combination is not available in the system. Please make sure the license key and/or email is correct and/or proceed to Sign Up')
+        msg_state.append('error')
+
+    if num == 1:
+        query_db("DELETE FROM users WHERE HL = '{}' AND HE = '{}' ".format(
+                    hashlib.sha512(license_key.encode()).hexdigest(), hashlib.sha512(email.encode()).hexdigest() ))
+        msg.append('Your Data has been removed from system. Please Sign Up Again')
+        msg_state.append('success')
+
+    return msg_state, msg
+
+def topBar():
+    st.title('Color By Numbers')
+    msg_container = st.empty()
+    signin_tab, forgot_tab, signup_tab = st.tabs(['Sign In', 'Forgot Details', 'Sign Up'])
+    signin_form, signforget_form, signup_form = None, None, None
+    msg_states=[]
+
+    with signup_tab:
+        signup_form = st.form('signUp-form', clear_on_submit=True)
+        signup_form.subheader('Register New User')
+        signup_name = str(signup_form.text_input('Name', value=''))
+        signup_email = str(signup_form.text_input('email', value=''))
+        signup_username = str(signup_form.text_input('Enter Username', value=''))
+        signup_password = str(signup_form.text_input('Enter Password', value='', type='password'))
+        signup_rep_password = str(signup_form.text_input('Enter Password again', value='', type='password'))
+        signup_license_key = str(signup_form.text_input('Enter your License Key', value=''))
+        signUp_Btn = signup_form.form_submit_button('Sign Up')
+    if signUp_Btn:
+        msg_states, msgs = signUp(signup_name, signup_email, signup_username, signup_password, signup_rep_password, signup_license_key)
+
+    with signin_tab:
+        signin_form = st.form('signIn-form', clear_on_submit=True)
+        signin_form.subheader('Sign In')
+        signIn_username = str(signin_form.text_input('Username', value=''))
+        signIn_password = str(signin_form.text_input('Password', value='', type='password'))
+        signIn_Btn = signin_form.form_submit_button('Sign In')
+    if signIn_Btn:
+        msg_states, msgs = signIn(signIn_username, signIn_password)
+
+    with forgot_tab:
+        signforget_form = st.form('ForgotCredentials-form', clear_on_submit=True)
+        signforget_form.subheader('Reset Your Data')
+        forgot_email = str(signforget_form.text_input('email', value=''))
+        forgot_license = str(signforget_form.text_input('License Key', value=''))
+        forgot_Btn = signforget_form.form_submit_button('Reset Data')
+    if forgot_Btn:
+        msg_states, msgs = forgotDetails(forgot_license, forgot_email)
+
+    with msg_container.container():
+        if len(msg_states)>0:
+            for i,msg_state in enumerate(msg_states):
+                if msg_state == 'success':
+                    st.success(msgs[i])
+                elif msg_state == 'warning':
+                    st.warning(msgs[i])
+                elif msg_state == 'error':
+                    st.error(msgs[i])
+            time.sleep(3)
+            msg_states=[]
+            msgs = []
+            msg_container.empty()
+
+def main():
     # defining session state variables
-    img_dict = {'img_name':'', 'inp':'', 'zoom':'', 'out':None, 'quantized': None, 'color_map': None, 'out_color_map':None, 'colormap_tuples':[], 'colormap_text':[]}
+    if 'user' not in st.session_state.keys():
+        st.session_state.user = ''
+    if 'logged' not in st.session_state.keys():
+        st.session_state.logged = False
+
+    img_dict = {'img_name':'', 'inp':'', 'zoom':'',
+                'out':None, 'quantized': None, 'color_map': None,
+                'out_color_map':None, 'colormap_tuples':[], 'colormap_text':[],
+                'show_clr_box':True, 'zoom_factor':1, 'hor_border':0.0, 'ver_border':0.0}
     if 'imgs' not in st.session_state.keys():
         st.session_state.imgs=[]
     if 'imgs_ix' not in st.session_state.keys():
@@ -235,112 +451,158 @@ def main():
     if 'tmp_file_set' not in st.session_state.keys():
         st.session_state.tmp_file_set = set()
 
+    # login panel
+    if st.session_state.logged == False:
+        topBar()
+        time.sleep(2)
+        if st.session_state.logged == True:
+            st.experimental_rerun()
+
     # Main application
-    st.title('Color By Numbers')
+    if st.session_state.logged:
+        # defining side bar settings for easier access
+        is_logout = st.sidebar.button('Sign Out')
+        if is_logout:
+            for key in st.session_state.keys():
+                del st.session_state[key]
+            st.session_state.user = ''
+            st.session_state.logged = False
+            st.experimental_rerun()
+        is_clear = st.sidebar.button('Clear All Data')
+        if is_clear:
+            st.sidebar.info('To properly delete all data, make sure there are no files listed by name below the file uploader window by pressing the [X] button beside each file')
+            time.sleep(3)
+            for key in st.session_state.keys():
+                if key not in ['user','logged', 'state']:
+                    del st.session_state[key]
+            st.experimental_rerun()
 
-    # read images from file system and store them in session_state.imgs
-    img_streams = st.file_uploader('Select Images', type=['png','jpeg','jpg'],  accept_multiple_files=True)
-    if len(img_streams)>0:
-        new_file_names = [i.name for i in img_streams]
-        new_file_set = set(new_file_names)
-        diff_file_set = new_file_set.difference(st.session_state.tmp_file_set)
-        for img_stream in img_streams:
-            if img_stream.name in diff_file_set:
-                img_bytes = img_stream.getvalue()
-                cv_img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
-                entry = deepcopy(img_dict)
-                entry['img_name'] = img_stream.name
-                entry['inp'] = cv_img
-                entry['zoom'] = cv_img
-                st.session_state.imgs.append(entry)
-                st.session_state.tmp_file_set.add(img_stream.name)
-                st.session_state.imgs_ix +=1
+        # Main application
+        cols = st.columns(5)
+        with cols[-1]:
+            st.write('*Hello, {}*'.format(st.session_state.user))
+        st.title('Color By Numbers')
 
-    # add navigation controls
-    col01, col02, col03, col04, col05 = st.columns([2,1,2,2,2]) #prev, imgs_ix, next, generate, save_all
-    progress = st.progress(0)
-    if st.session_state.imgs_ix>=0:
-        zoom_factor = st.select_slider('Zoom', options=[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1,1.5,2,2.5,3], value=1)
-        resize(st.session_state.imgs, st.session_state.imgs_ix, zoom_factor)
-        cntnr01 = st.expander('ColorMap Controls', expanded=True)
-        with cntnr01:
-            num_clrs_slider = st.slider('Select number of colors required', min_value=1, max_value=50, value=10, step=int(1))
-            tolerance_slider = st.slider('Select tolerance to group similar colors', min_value=0, max_value=100, value=32, step=int(1))
-            _,col101, col102,_ = st.columns([1,1,1,1]) # 101: color map button, 102: update caption button
+        # read images from file system and store them in session_state.imgs
+        img_streams = st.file_uploader('Select Images', type=['png','jpeg','jpg'],  accept_multiple_files=True)
+        if len(img_streams)>0:
+            new_file_names = [i.name for i in img_streams]
+            new_file_set = set(new_file_names)
+            diff_file_set = new_file_set.difference(st.session_state.tmp_file_set)
+            for img_stream in img_streams:
+                if img_stream.name in diff_file_set:
+                    img_bytes = img_stream.getvalue()
+                    cv_img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+                    entry = deepcopy(img_dict)
+                    entry['img_name'] = img_stream.name
+                    entry['inp'] = cv_img
+                    entry['zoom'] = cv_img
+                    st.session_state.imgs.append(entry)
+                    st.session_state.tmp_file_set.add(img_stream.name)
+                    st.session_state.imgs_ix +=1
 
-            col201, col202 = st.columns([1,2]) #201: color patch, 202: caption
-            if len(st.session_state.imgs[st.session_state.imgs_ix]['colormap_tuples'])>0:
-                txt_lst = ['']* len(st.session_state.imgs[st.session_state.imgs_ix]['colormap_text'])
-                with col201:
-                    for color in st.session_state.imgs[st.session_state.imgs_ix]['colormap_tuples']:
-                        st.write('')
-                        st.write('')
-                        st.image(cv2.rectangle(np.zeros((40,40,3),dtype='uint8'),(2,2),(38,38),color, thickness=-1), channels='BGR')
-                with col202:
-                    for i, text in enumerate(st.session_state.imgs[st.session_state.imgs_ix]['colormap_text']):
-                        placeholder ='{}'.format(st.session_state.imgs[st.session_state.imgs_ix]['colormap_tuples'][i][::-1])
-                        key = '{}-{}'.format(st.session_state.imgs[st.session_state.imgs_ix]['img_name'],i)
-                        txt_lst[i] = st.text_input('Caption '+str(i),value = text, placeholder=placeholder, key=key)
-                        if len(txt_lst[i])==0:
-                            txt_lst[i] = placeholder
-            with col101:
-                blank_clr_btn = st.button('ColorMap', on_click=blank_colormap, args=(st.session_state.imgs, st.session_state.imgs_ix, num_clrs_slider, tolerance_slider))
-            with col102:
-                update_caption_dsbl = True if len(st.session_state.imgs[st.session_state.imgs_ix]['colormap_tuples']) == 0 else False
-                is_update_caption = st.button('Update Caption', disabled=update_caption_dsbl)
-                if is_update_caption:
-                    st.session_state.imgs[st.session_state.imgs_ix]['colormap_text'] = txt_lst
-    else:
-        num_clrs_slider = 0
-        zoom_factor = 1
-        tolerance_slider=32
-
-    with col01:
-        prev_dsbl = True if st.session_state.imgs_ix <=0 else False
-        is_prev = st.button('Prev', on_click=ix_change, kwargs={'mode':-1}, disabled=prev_dsbl)
-    with col02:
-        st.write(str(st.session_state.imgs_ix) if st.session_state.imgs_ix>=0 else '-')
-    with col03:
-        next_dsbl = True if st.session_state.imgs_ix >= len(st.session_state.imgs)-1 else False
-        is_next = st.button('Next', on_click=ix_change, kwargs={'mode':1}, disabled=next_dsbl)
-    with col04:
-        gen_dsbl = True if len(st.session_state.imgs)<=0 else False
-        is_gen = st.button('Generate', on_click=generate, args=(st.session_state.imgs, st.session_state.imgs_ix, num_clrs_slider, progress), disabled=gen_dsbl)
-        if is_gen:
-            st.balloons()
-    with col05:
-        save_dsbl = True if len(st.session_state.imgs)<=0 else False
-        dt = '%Y-%m-%d-%H-%M-%S'
-        is_save_all = st.download_button('Save All', save_results(), file_name='ColorByNumber-'+datetime.now().strftime(dt)+'.zip', mime='application/x-zip', disabled=save_dsbl)
-
-    col11, col12 = st.columns(2)
-    with col11:
-        # display the input image
+        # add navigation controls
+        col01, col02, col03, col04, col05 = st.columns([2,1,2,2,2]) #prev, imgs_ix, next, generate, save_all
+        progress = st.progress(0)
         if st.session_state.imgs_ix>=0:
-            st.image(st.session_state.imgs[st.session_state.imgs_ix]['zoom'], channels='BGR')
-            h,w = st.session_state.imgs[st.session_state.imgs_ix]['zoom'].shape[:2]
-            st.write('Resolution: {} x {}'.format(w,h))
-    with col12:
-        # display the quantized image
-        if st.session_state.imgs_ix>=0 and st.session_state.imgs[st.session_state.imgs_ix]['quantized'] is not None:
-            st.image(st.session_state.imgs[st.session_state.imgs_ix]['quantized'], channels='BGR')
-            st.write('Image redrawn using ColorMap')
+            cntnr01 = st.expander('ColorMap Controls', expanded=False)
+            cntnr02 = st.expander('Image Controls', expanded=False)
 
-    col21, col22 = st.columns(2)
-    with col21:
-        # display the CBN image
-        if st.session_state.imgs_ix>=0 and st.session_state.imgs[st.session_state.imgs_ix]['out'] is not None:
-            st.image(st.session_state.imgs[st.session_state.imgs_ix]['out'], channels='BGR')
-            st.write('Color By Number Image')
-    with col22:
-        # display the output image + color_map combined
-        if st.session_state.imgs_ix>=0 and st.session_state.imgs[st.session_state.imgs_ix]['out_color_map'] is not None:
-            st.image(st.session_state.imgs[st.session_state.imgs_ix]['out_color_map'], channels='BGR')
-            st.write('Final Image with ColorMap')
-    # display the color map
-    if st.session_state.imgs_ix>=0 and st.session_state.imgs[st.session_state.imgs_ix]['color_map'] is not None:
-        st.image(st.session_state.imgs[st.session_state.imgs_ix]['color_map'], channels='BGR')
-        st.write('ColorMap')
+            with cntnr02:
+                key= st.session_state.imgs[st.session_state.imgs_ix]['img_name']
+                zoom_factor = st.select_slider('Zoom', options=[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1,1.5,2,2.5,3], value=st.session_state.imgs[st.session_state.imgs_ix]['zoom_factor'], key=key+'z')
+                st.session_state.imgs[st.session_state.imgs_ix]['zoom_factor'] = zoom_factor
+                resize(st.session_state.imgs, st.session_state.imgs_ix, zoom_factor)
+                col31, col32 = st.columns(2)
+                with col31:
+                    hor = st.slider('Horizontal Border Limit', min_value=0, max_value=15, value=int(st.session_state.imgs[st.session_state.imgs_ix]['hor_border'] * 100), step=1, key=key+'h') / 100
+                    st.session_state.imgs[st.session_state.imgs_ix]['hor_border'] = hor
+                with col32:
+                    ver = st.slider('Vertical Border Limit', min_value=0, max_value=15, value=int(st.session_state.imgs[st.session_state.imgs_ix]['ver_border'] *100), step=1, key=key+'v') / 100
+                    st.session_state.imgs[st.session_state.imgs_ix]['ver_border'] = ver
+                st.session_state.imgs[st.session_state.imgs_ix]['zoom'] = remove_border(st.session_state.imgs[st.session_state.imgs_ix]['zoom'],ver,hor)
+
+            with cntnr01:
+                num_clrs_slider = st.slider('Select number of colors required', min_value=1, max_value=50, value=10, step=int(1))
+                tolerance_slider = st.slider('Select tolerance to group similar colors', min_value=0, max_value=100, value=32, step=int(1))
+                col101,_,col102, _,col103 = st.columns([2,1,2,1,2]) # 101: color map button, 102: update caption button
+
+                col201, col202 = st.columns([1,2]) #201: color patch, 202: caption
+                if len(st.session_state.imgs[st.session_state.imgs_ix]['colormap_tuples'])>0:
+                    txt_lst = ['']* len(st.session_state.imgs[st.session_state.imgs_ix]['colormap_text'])
+                    with col201:
+                        for color in st.session_state.imgs[st.session_state.imgs_ix]['colormap_tuples']:
+                            st.write('')
+                            st.write('')
+                            st.image(cv2.rectangle(np.zeros((40,40,3),dtype='uint8'),(2,2),(38,38),color, thickness=-1), channels='BGR')
+                    with col202:
+                        for i, text in enumerate(st.session_state.imgs[st.session_state.imgs_ix]['colormap_text']):
+                            placeholder ='{}'.format(st.session_state.imgs[st.session_state.imgs_ix]['colormap_tuples'][i][::-1])
+                            key = '{}-{}'.format(st.session_state.imgs[st.session_state.imgs_ix]['img_name'],i)
+                            txt_lst[i] = st.text_input('Caption '+str(i),value = text, placeholder=placeholder, key=key)
+                            if len(txt_lst[i])==0:
+                                txt_lst[i] = placeholder
+                with col101:
+                    key = '{}-clrbox-chkbx'.format(st.session_state.imgs[st.session_state.imgs_ix]['img_name'])
+                    st.session_state.imgs[st.session_state.imgs_ix]['show_clr_box'] = st.checkbox('Show Color Box', value=st.session_state.imgs[st.session_state.imgs_ix]['show_clr_box'], key=key)
+                with col102:
+                    blank_clr_btn = st.button('ColorMap', on_click=blank_colormap, args=(st.session_state.imgs, st.session_state.imgs_ix, num_clrs_slider, tolerance_slider))
+                with col103:
+                    update_caption_dsbl = True if len(st.session_state.imgs[st.session_state.imgs_ix]['colormap_tuples']) == 0 else False
+                    is_update_caption = st.button('Update Caption', disabled=update_caption_dsbl)
+                    if is_update_caption:
+                        st.session_state.imgs[st.session_state.imgs_ix]['colormap_text'] = txt_lst
+        else:
+            num_clrs_slider = 0
+            zoom_factor = 1
+            tolerance_slider=32
+
+        with col01:
+            prev_dsbl = True if st.session_state.imgs_ix <=0 else False
+            is_prev = st.button('Prev', on_click=ix_change, kwargs={'mode':-1}, disabled=prev_dsbl)
+        with col02:
+            st.write(str(st.session_state.imgs_ix) if st.session_state.imgs_ix>=0 else '-')
+        with col03:
+            next_dsbl = True if st.session_state.imgs_ix >= len(st.session_state.imgs)-1 else False
+            is_next = st.button('Next', on_click=ix_change, kwargs={'mode':1}, disabled=next_dsbl)
+        with col04:
+            gen_dsbl = True if len(st.session_state.imgs)<=0 or len(st.session_state.imgs[st.session_state.imgs_ix]['colormap_tuples'])<=0 else False
+            is_gen = st.button('Generate', on_click=generate, args=(st.session_state.imgs, st.session_state.imgs_ix, num_clrs_slider, progress), disabled=gen_dsbl)
+            if is_gen:
+                st.balloons()
+        with col05:
+            save_dsbl = True if len(st.session_state.imgs)<=0 else False
+            dt = '%Y-%m-%d-%H-%M-%S'
+            is_save_all = st.download_button('Save All', save_results(), file_name='ColorByNumber-'+datetime.now().strftime(dt)+'.zip', mime='application/x-zip', disabled=save_dsbl)
+
+        col11, col12 = st.columns(2)
+        with col11:
+            # display the input image
+            if st.session_state.imgs_ix>=0:
+                st.image(st.session_state.imgs[st.session_state.imgs_ix]['zoom'], channels='BGR')
+                h,w = st.session_state.imgs[st.session_state.imgs_ix]['zoom'].shape[:2]
+                st.write('Resolution: {} x {}'.format(w,h))
+        with col12:
+            # display the quantized image
+            if st.session_state.imgs_ix>=0 and st.session_state.imgs[st.session_state.imgs_ix]['quantized'] is not None:
+                st.image(st.session_state.imgs[st.session_state.imgs_ix]['quantized'], channels='BGR')
+                st.write('Image redrawn using ColorMap')
+
+        col21, col22 = st.columns(2)
+        with col21:
+            # display the CBN image
+            if st.session_state.imgs_ix>=0 and st.session_state.imgs[st.session_state.imgs_ix]['out'] is not None:
+                st.image(st.session_state.imgs[st.session_state.imgs_ix]['out'], channels='BGR')
+                st.write('Color By Number Image')
+        with col22:
+            # display the output image + color_map combined
+            if st.session_state.imgs_ix>=0 and st.session_state.imgs[st.session_state.imgs_ix]['out_color_map'] is not None:
+                st.image(st.session_state.imgs[st.session_state.imgs_ix]['out_color_map'], channels='BGR')
+                st.write('Final Image with ColorMap')
+        # display the color map
+        if st.session_state.imgs_ix>=0 and st.session_state.imgs[st.session_state.imgs_ix]['color_map'] is not None:
+            st.image(st.session_state.imgs[st.session_state.imgs_ix]['color_map'], channels='BGR')
+            st.write('ColorMap')
 
 if __name__ == '__main__':
     main()

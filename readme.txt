@@ -1,4 +1,6 @@
-# Color By Number
+# Color By Numbers
+
+### This app is available here: https://hanisalah-color-by-numbers.streamlit.app/
 
 ## Features
 1. This repo converts images to color by number (images are outlined and each area is indicated with a color number to draw)
@@ -11,11 +13,12 @@
 ### Local Installation
 1. Create a new python environment - e.g.: ```conda create -n <env_name> python=<version>```
 2. Activate the new environment - e.g.: ```conda activate <env_name>```
-3. Install required packages in requirements_local.txt - ```pip install -r requirements_local.txt```
+3. Install required packages in requirements_local.txt - ```pip install -r requirements_local.txt```. Don't use requirements.txt for local installation as this is reserved for deployment use.
 4. Open the webapp - ```streamlit run main.py```
 
 ### Deploy to streamlit share
 1. Create a github repo using a clone of this repo.
 2. Login to your www.streamlit.io account.
 3. Follow on screen instructions to link the repo to your streamlit account.
+4. Copy secrets.toml file content to the app settings as shown in https://docs.streamlit.io/streamlit-cloud/get-started/deploy-an-app/connect-to-data-sources/secrets-management
 4. Use the provided link to open the app from any web browser.

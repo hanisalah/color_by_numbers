@@ -1,4 +1,7 @@
+mysql-connector-python
 streamlit
 numpy
 opencv-python
 extcolors
+certifi
+cryptocode

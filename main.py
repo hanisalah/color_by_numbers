@@ -6,7 +6,7 @@ import hashlib
 import certifi
 import extcolors
 import numpy as np
-from PIL import Image, ImageChops
+from PIL import Image
 import mysql.connector
 import streamlit as st
 from io import BytesIO
@@ -15,6 +15,7 @@ from copy import deepcopy
 from zipfile import ZipFile
 from datetime import datetime
 from urllib import request, parse, error
+import largestinteriorrectangle as lir
 
 def ix_change(mode=0):
     """manipulate index of image to be shown based on clicks from relevant prev/next buttons"""
@@ -51,10 +52,6 @@ def resize(img, ix, zoom_factor):
     img[ix]['zoom'] = inp
 
 def remove_border(img, ver, hor):
-
-    # add 5 pixels to image in each direction
-    img = cv2.copyMakeBorder(img,5,5,5,5,cv2.BORDER_CONSTANT,img[0,0])
-
     # clean out border
     v = int(ver*img.shape[0])
     h = int(hor*img.shape[1])
@@ -67,26 +64,42 @@ def remove_border(img, ver, hor):
         img[:, img.shape[1]-h-5:img.shape[1]]=color
 
     #remove background
-    cv2.floodFill(img, None, (0,0), (255,255,255))
-    cv2.floodFill(img, None, (img.shape[1]-5,0), (255,255,255))
-    cv2.floodFill(img, None, (0,img.shape[0]-5), (255,255,255))
-    cv2.floodFill(img, None, (img.shape[1]-5,img.shape[0]-5), (255,255,255))
+    img = cv2.floodFill(img, None, (0,0), (255,255,255))[1]
+    img = cv2.floodFill(img, None, (img.shape[1]-5,0), (255,255,255))[1]
+    img = cv2.floodFill(img, None, (0,img.shape[0]-5), (255,255,255))[1]
+    img = cv2.floodFill(img, None, (img.shape[1]-5,img.shape[0]-5), (255,255,255))[1]
+
+    # add 1% white pixels to image in each direction to isolate outer most contour (it will be cleared in CBN)
+    hor = np.ones((img.shape[0], max(int(img.shape[1]*0.01),15), img.shape[2]), dtype='uint8')*255
+    img = np.hstack((hor,img,hor))
+    ver = np.ones((max(int(img.shape[0]*0.01),15), img.shape[1], img.shape[2]), dtype='uint8')*255
+    img = np.vstack((ver,img,ver))
 
     return img
 
 def clean(img):
     """remove noise from image"""
+    # emphasis black outline around the image outline
+    #bw = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    #background_sample = bw[5,5] #get a point at the top left corner of image to represent background
+    #if abs(background_sample - 0) > abs(background_sample - 255): #if background sample is more whitish than blackish
+        #flags = cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
+    #else:
+        #flags = cv2.THRESH_BINARY | cv2.THRESH_OTSU
+    #bw = cv2.threshold(bw, 0, 255, flags)[1]
+    #cnts,hier = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    #cv2.drawContours(img,cnts,-1,0,thickness=3)
+
     #denoise
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (8,8))
     image =  cv2.fastNlMeansDenoisingColored(img,None,10,10,7,21)
-    image = cv2.morphologyEx(image, cv2.MORPH_OPEN, kernel, cv2.BORDER_REPLICATE)
-    image = cv2.morphologyEx(image, cv2.MORPH_CLOSE, kernel, cv2.BORDER_REPLICATE)
+    #image = cv2.morphologyEx(image, cv2.MORPH_OPEN, kernel, cv2.BORDER_REPLICATE)
+    #image = cv2.morphologyEx(image, cv2.MORPH_CLOSE, kernel, cv2.BORDER_REPLICATE)
     return image
 
 def generate(img, ix, num_clrs, progress_bar):
     """generate 'color by number' image from the passed image, index and number of color clusters"""
     inp = deepcopy(img[ix]['zoom']) #resize is performed separately for interface convenience
-    #image = inp #image = resize(inp)
     image = clean(inp)
     colormap = img[ix]['colormap_tuples']
     colortxt = img[ix]['colormap_text']
@@ -127,68 +140,64 @@ def quantize(img, colormap, colortext):
 
 def CBN(img, colors, progress_bar):
     canvas = np.ones((img.shape[0],img.shape[1],img.shape[2]),dtype='uint8') * 255 #used to draw the final CBN image
-    #used to draw a negative (black) of the contour to exclude areas not suitable to place text of next contour.
-    negative = np.ones((img.shape[0],img.shape[1]),dtype='uint8') * 255
+
     #release contours from its hierarchy and have it as an unnested list of contours
     contours = []
     for ind, color in enumerate(colors):
         color = np.asarray(color, dtype='uint8')
         mask = cv2.inRange(img, color, color)
-        #mask = clean(img)
-        cnts,hier = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        cnts,hier = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
         c = [{'cnt':cnt,'ind':ind+1} for cnt in cnts if
             cv2.boundingRect(cnt)[2]>10
             and cv2.boundingRect(cnt)[3]>10
             and cv2.contourArea(cnt,False)>100]
         contours.extend(c)
-    contours = sorted(contours, key= lambda x:cv2.contourArea(x['cnt'],False), reverse=False) #arcLength can also be used
+    contours = sorted(contours, key= lambda x:cv2.contourArea(x['cnt'],False), reverse=False) #arcLength, contourArea can also be used
     txts = tuple([str(x['ind']) for x in contours])
     contours = tuple([x['cnt'] for x in contours])
 
+    passed_cnts = []
+
     for i, cnt in enumerate(contours):
-        # consider only contours within 95% of image size.
-        cnt_x, cnt_y, cnt_w, cnt_h = cv2.boundingRect(cnt)
-        if cnt_w < 0.95*canvas.shape[1] and cnt_h <0.95*canvas.shape[0]:
+        # draw contour
+        cv2.drawContours(canvas,contours,i,0,thickness=1)
 
-            # draw contour
-            cv2.drawContours(canvas,[cnt],-1,0,thickness=1)
+        # determine best location and best text size to place text
+        font_scale = 1
+        flag =True
 
-            #identify suitable place to put text
-            patch = negative[cnt_y:cnt_y+cnt_h, cnt_x:cnt_x+cnt_w] #get a patch from the negative
-            font_scale=1
-            flag = True
-            while flag:
-                if font_scale >0.5: #try to find a suitable place to put the text with font scale from 1 to 0.5
-                    txt_w, txt_h = cv2.getTextSize(txts[i], cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)[0] #get the text size in w x h
-                    if patch.shape[0]>txt_h and patch.shape[1]>txt_w: #check patch is bigger than text
-
-                        #select indices that when considered as a top-left coordinate for text result in complete white box that is inside the contour
-                        white_patches = np.argwhere(np.lib.stride_tricks.sliding_window_view(patch,(txt_h,txt_w)).all(axis=(-2,-1)))
-                        white_patches = white_patches.tolist()
-                        white_patches = [x for x in white_patches if
-                                        cv2.pointPolygonTest(cnt, (x[1]+cnt_x,x[0]+cnt_y), False)>0 #TL of text in contour
-                                        and cv2.pointPolygonTest(cnt, (x[1]+cnt_x+txt_w,x[0]+cnt_y), False)>0 #TR of text in contour
-                                        and cv2.pointPolygonTest(cnt, (x[1]+cnt_x+txt_w,x[0]+cnt_y+txt_h), False)>0 #BR of text in contour
-                                        and cv2.pointPolygonTest(cnt, (x[1]+cnt_x,x[0]+cnt_y+txt_h), False)>0 ] #BL of text in contour
-
-                        if len(white_patches)>0: # if there are top-left coordinates found, use the first coordinate (any one can be as good) to place text
-                            txt_x = white_patches[0][1]+cnt_x
-                            txt_y = white_patches[0][0]+cnt_y+txt_h
-                            cv2.putText(canvas, txts[i], (txt_x, txt_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, 0, 1)
-                            flag = False
-                        else: #no top-left coordinates found, decrease font scale and try again
-                            font_scale -=0.1
-                    else: #patch is smaller than text, decrease font and try again
-                        font_scale -=0.1
-                else: #we reached minimum possible font size. Place text at centroid of contour
-                    M = cv2.moments(cnt) #use contour centroid
-                    txt_x = int(M["m10"] / M['m00'])
-                    txt_y = int(M["m01"] / M['m00'])
-                    cv2.putText(canvas, txts[i], (txt_x, txt_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, 0, 1)
-                    flag= False
-
-            cv2.drawContours(negative,[cnt],-1,0,thickness=cv2.FILLED) #fill the contour in negative with black (to create negative)
+        #used to draw a negative (black) of the contour to exclude areas not suitable to place text of next contour.
+        negative = np.zeros((img.shape[0],img.shape[1]),dtype='uint8')
+        cv2.drawContours(negative, [cnt], -1, 1, thickness=cv2.FILLED) #draw contour filled with value 1 (indicative of white for uint8 img, indicative of true for bool img)
+        if len(passed_cnts)!=0: # if this is not the first contour
+            for p_cnt in passed_cnts:
+                cv2.drawContours(negative, [p_cnt], -1, 0, thickness=cv2.FILLED) #draw all previous contours filled with value 0 (indicative of black for uint8 img, false for bool img)
+        negative = negative.astype('bool') #convert negative to bool array
+        c = cnt[:,0,:] # prepare contour
+        x,y,w,h = lir.lir(negative, c) #get largest inerior white rectangle within contour c
+        while flag and font_scale >0.1:
+            txt_w, txt_h = cv2.getTextSize(txts[i], cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)[0] #get the text size in w x h
+            if w>= txt_w and h >= txt_h: #if largest white interior rectangle is bigger than text dimensions
+                txt_x = x + int((w - txt_w)/2)
+                txt_y = y + txt_h + int((h - txt_h)/2)
+                cv2.putText(canvas, txts[i], (txt_x, txt_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, 0, 1) #place text
+                negative = negative.astype('uint8') #convert negative to uint8
+                cv2.drawContours(negative,contours,i,0,thickness=cv2.FILLED) #fill the contour in negative with black (to create negative)
+                negative = negative.astype('bool') #convert negative to bool to be used again in lir
+                passed_cnts.append(cnt) #append contour to list of passed contours
+                flag = False #exit while loop for this contour
+            else: #largest white interior rectangle is smaller than text dimension, reduce font scale and try again
+                font_scale -= 0.1
         progress_bar.progress(i/len(contours))
+
+    #Now we need to remove the outermost contour representing a frame for the background of the image
+    negative = np.zeros((img.shape[0],img.shape[1]),dtype='uint8') #total black image
+    for p_cnt in passed_cnts:
+        cv2.drawContours(negative, [p_cnt], -1, 255) #draw all contors as white lines on black image
+    cnts, _ = cv2.findContours(negative, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE) #get the outermost contour
+    cnt = sorted(cnts, key=cv2.contourArea, reverse=True)[0]
+    cv2.drawContours(canvas,[cnt],-1,(255,255,255)) #draw the outermost contour in white over the canvas (our result image)
+
     return canvas
 
 def draw_colormap(colormap, colortext, h, w, show_clr_box):
@@ -580,8 +589,9 @@ def main():
             # display the input image
             if st.session_state.imgs_ix>=0:
                 st.image(st.session_state.imgs[st.session_state.imgs_ix]['zoom'], channels='BGR')
-                h,w = st.session_state.imgs[st.session_state.imgs_ix]['zoom'].shape[:2]
-                st.write('Resolution: {} x {}'.format(w,h))
+                st.write('Zoomed / Padded / Cropped Image')
+                #h,w = st.session_state.imgs[st.session_state.imgs_ix]['zoom'].shape[:2]
+                #st.write('Zoomed / Padded / Cropped Image - Resolution: {} x {}'.format(w,h))
         with col12:
             # display the quantized image
             if st.session_state.imgs_ix>=0 and st.session_state.imgs[st.session_state.imgs_ix]['quantized'] is not None:

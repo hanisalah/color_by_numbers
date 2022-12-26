@@ -14,8 +14,8 @@ import cryptocode as crc
 from copy import deepcopy
 from zipfile import ZipFile
 from datetime import datetime
-from urllib import request, parse, error
 import largestinteriorrectangle as lir
+from urllib import request, parse, error
 
 def ix_change(mode=0):
     """manipulate index of image to be shown based on clicks from relevant prev/next buttons"""
@@ -55,46 +55,37 @@ def remove_border(img, ver, hor):
     # clean out border
     v = int(ver*img.shape[0])
     h = int(hor*img.shape[1])
-    color = [255,255,255]
+    color = img[0,0].tolist() #[255,255,255]
+    #equalize frame color between image border and end of frame (assumed as 5 pixels after defined frame)
     if v>0:
         img[:v+5,:] = color
         img[img.shape[0]-v-5:img.shape[0],:]=color
     if h>0:
         img[:, :h+5] = color
         img[:, img.shape[1]-h-5:img.shape[1]]=color
+    #flood fill the equalized frame color with background color
+    if v>0 or h>0:
+        #remove background
+        img = cv2.floodFill(img, None, (0,0), color)[1]
+        img = cv2.floodFill(img, None, (img.shape[1]-5,0), color)[1]
+        img = cv2.floodFill(img, None, (0,img.shape[0]-5), color)[1]
+        img = cv2.floodFill(img, None, (img.shape[1]-5,img.shape[0]-5), color)[1]
 
-    #remove background
-    img = cv2.floodFill(img, None, (0,0), (255,255,255))[1]
-    img = cv2.floodFill(img, None, (img.shape[1]-5,0), (255,255,255))[1]
-    img = cv2.floodFill(img, None, (0,img.shape[0]-5), (255,255,255))[1]
-    img = cv2.floodFill(img, None, (img.shape[1]-5,img.shape[0]-5), (255,255,255))[1]
-
-    # add 1% white pixels to image in each direction to isolate outer most contour (it will be cleared in CBN)
-    hor = np.ones((img.shape[0], max(int(img.shape[1]*0.01),15), img.shape[2]), dtype='uint8')*255
+    # add 1% pixels to image with same color in each direction to isolate outer most contour (it will be cleared in CBN)
+    hor = np.ones((img.shape[0], max(int(img.shape[1]*0.01),15), img.shape[2]), dtype='uint8')
+    hor[...] = [255,255,255]
     img = np.hstack((hor,img,hor))
-    ver = np.ones((max(int(img.shape[0]*0.01),15), img.shape[1], img.shape[2]), dtype='uint8')*255
+    ver = np.ones((max(int(img.shape[0]*0.01),15), img.shape[1], img.shape[2]), dtype='uint8')
+    ver[...] = [255,255,255]
     img = np.vstack((ver,img,ver))
 
     return img
 
 def clean(img):
     """remove noise from image"""
-    # emphasis black outline around the image outline
-    #bw = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    #background_sample = bw[5,5] #get a point at the top left corner of image to represent background
-    #if abs(background_sample - 0) > abs(background_sample - 255): #if background sample is more whitish than blackish
-        #flags = cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
-    #else:
-        #flags = cv2.THRESH_BINARY | cv2.THRESH_OTSU
-    #bw = cv2.threshold(bw, 0, 255, flags)[1]
-    #cnts,hier = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    #cv2.drawContours(img,cnts,-1,0,thickness=3)
-
     #denoise
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (8,8))
     image =  cv2.fastNlMeansDenoisingColored(img,None,10,10,7,21)
-    #image = cv2.morphologyEx(image, cv2.MORPH_OPEN, kernel, cv2.BORDER_REPLICATE)
-    #image = cv2.morphologyEx(image, cv2.MORPH_CLOSE, kernel, cv2.BORDER_REPLICATE)
     return image
 
 def generate(img, ix, num_clrs, progress_bar):
@@ -139,6 +130,7 @@ def quantize(img, colormap, colortext):
     return color_view
 
 def CBN(img, colors, progress_bar):
+    """ Draw Color-By-Numbers Image """
     canvas = np.ones((img.shape[0],img.shape[1],img.shape[2]),dtype='uint8') * 255 #used to draw the final CBN image
 
     #release contours from its hierarchy and have it as an unnested list of contours
@@ -501,7 +493,19 @@ def main():
             for img_stream in img_streams:
                 if img_stream.name in diff_file_set:
                     img_bytes = img_stream.getvalue()
-                    cv_img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+                    cv_img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_UNCHANGED)
+                    if cv_img.shape[2] == 4:
+                        h,w = cv_img.shape[0], cv_img.shape[1]
+                        bg = (255,255,255)
+                        bgr = np.zeros((h,w,3), dtype='float32')
+                        b, g, r, a = cv2.split(cv_img)
+                        a = np.asarray(a, dtype='float32')/255.0
+                        R,G,B = bg
+                        bgr[:,:,0] = b*a + (1.0 - a) * B
+                        bgr[:,:,1] = g*a + (1.0 - a) * G
+                        bgr[:,:,2] = r*a + (1.0 - a) * R
+                        cv_img = np.asarray(bgr, dtype='uint8')
+
                     entry = deepcopy(img_dict)
                     entry['img_name'] = img_stream.name
                     entry['inp'] = cv_img

@@ -413,7 +413,7 @@ def topBar():
         signin_form.subheader('Sign In')
         signIn_username = str(signin_form.text_input('Username', value='', disabled=True))
         signIn_password = str(signin_form.text_input('Password', value='', type='password', disabled=True))
-        signIn_guest = signin_form.checkbox('Guest Sign In')
+        signIn_guest = signin_form.checkbox('Guest Sign In', value=True, disabled=True)
         signIn_Btn = signin_form.form_submit_button('Sign In')
     if signIn_Btn:
         msg_states, msgs = signIn(signIn_username, signIn_password, signIn_guest)

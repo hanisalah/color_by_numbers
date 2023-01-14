@@ -341,24 +341,30 @@ def signUp(name, email, username, password, rep_password, license_key):
         msg_state.append('success')
     return msg_state, msg
 
-def signIn(username, password):
+def signIn(username, password, isGuest):
     st.session_state.user = ''
     st.session_state.logged = False
     msg = []
     msg_state = []
     username = username.lower()
 
-    # from db each line is [id, name_pass, email_pass, username_pass, hash_password, hash_license, hash_user, hash_email]
-    num, rows = query_db("SELECT NP, UP FROM users WHERE HU = '{}' ".format( hashlib.sha512(username.encode()).hexdigest() ))
+    if isGuest == False:
+        # from db each line is [id, name_pass, email_pass, username_pass, hash_password, hash_license, hash_user, hash_email]
+        num, rows = query_db("SELECT NP, UP FROM users WHERE HU = '{}' ".format( hashlib.sha512(username.encode()).hexdigest() ))
 
-    if num == 1 and crc.decrypt(rows[0][1], password) == username:
-        st.session_state.user = crc.decrypt(rows[0][0], password)
+        if num == 1 and crc.decrypt(rows[0][1], password) == username:
+            st.session_state.user = crc.decrypt(rows[0][0], password)
+            st.session_state.logged = True
+            msg.append('Sign In Successful')
+            msg_state.append('success')
+        else:
+            msg.append('Username / Password Mismatch! Please try again.')
+            msg_state.append('error')
+    else:
+        st.session_state.user = 'Guest'
         st.session_state.logged = True
         msg.append('Sign In Successful')
         msg_state.append('success')
-    else:
-        msg.append('Username / Password Mismatch! Please try again.')
-        msg_state.append('error')
     return msg_state, msg
 
 def forgotDetails(license_key, email):
@@ -407,9 +413,10 @@ def topBar():
         signin_form.subheader('Sign In')
         signIn_username = str(signin_form.text_input('Username', value=''))
         signIn_password = str(signin_form.text_input('Password', value='', type='password'))
+        signIn_guest = signin_form.checkbox('Guest Sign In')
         signIn_Btn = signin_form.form_submit_button('Sign In')
     if signIn_Btn:
-        msg_states, msgs = signIn(signIn_username, signIn_password)
+        msg_states, msgs = signIn(signIn_username, signIn_password, signIn_guest)
 
     with forgot_tab:
         signforget_form = st.form('ForgotCredentials-form', clear_on_submit=True)

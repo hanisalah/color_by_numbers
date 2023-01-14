@@ -398,21 +398,21 @@ def topBar():
     with signup_tab:
         signup_form = st.form('signUp-form', clear_on_submit=True)
         signup_form.subheader('Register New User')
-        signup_name = str(signup_form.text_input('Name', value=''))
-        signup_email = str(signup_form.text_input('email', value=''))
-        signup_username = str(signup_form.text_input('Enter Username', value=''))
-        signup_password = str(signup_form.text_input('Enter Password', value='', type='password'))
-        signup_rep_password = str(signup_form.text_input('Enter Password again', value='', type='password'))
-        signup_license_key = str(signup_form.text_input('Enter your License Key', value=''))
-        signUp_Btn = signup_form.form_submit_button('Sign Up')
+        signup_name = str(signup_form.text_input('Name', value='', disabled=True))
+        signup_email = str(signup_form.text_input('email', value='', disabled=True))
+        signup_username = str(signup_form.text_input('Enter Username', value='', disabled=True))
+        signup_password = str(signup_form.text_input('Enter Password', value='', type='password', disabled=True))
+        signup_rep_password = str(signup_form.text_input('Enter Password again', value='', type='password', disabled=True))
+        signup_license_key = str(signup_form.text_input('Enter your License Key', value='', disabled=True))
+        signUp_Btn = signup_form.form_submit_button('Sign Up', disabled=True)
     if signUp_Btn:
         msg_states, msgs = signUp(signup_name, signup_email, signup_username, signup_password, signup_rep_password, signup_license_key)
 
     with signin_tab:
         signin_form = st.form('signIn-form', clear_on_submit=True)
         signin_form.subheader('Sign In')
-        signIn_username = str(signin_form.text_input('Username', value=''))
-        signIn_password = str(signin_form.text_input('Password', value='', type='password'))
+        signIn_username = str(signin_form.text_input('Username', value='', disabled=True))
+        signIn_password = str(signin_form.text_input('Password', value='', type='password', disabled=True))
         signIn_guest = signin_form.checkbox('Guest Sign In')
         signIn_Btn = signin_form.form_submit_button('Sign In')
     if signIn_Btn:
@@ -421,9 +421,9 @@ def topBar():
     with forgot_tab:
         signforget_form = st.form('ForgotCredentials-form', clear_on_submit=True)
         signforget_form.subheader('Reset Your Data')
-        forgot_email = str(signforget_form.text_input('email', value=''))
-        forgot_license = str(signforget_form.text_input('License Key', value=''))
-        forgot_Btn = signforget_form.form_submit_button('Reset Data')
+        forgot_email = str(signforget_form.text_input('email', value='', disabled=True))
+        forgot_license = str(signforget_form.text_input('License Key', value='', disabled=True))
+        forgot_Btn = signforget_form.form_submit_button('Reset Data', disabled=True)
     if forgot_Btn:
         msg_states, msgs = forgotDetails(forgot_license, forgot_email)
 
